@@ -39,6 +39,12 @@ tasks.register('run', JavaExec) {
 	mainClass = pluginMainClass
 
 	jvmArgs "-ea"
+	// Dev-run only (does NOT affect the built/published plugin): on modern JDKs, RuneLite's macOS
+	// UI code needs the legacy Apple APIs that java.desktop no longer exports by default.
+	if (org.gradle.internal.os.OperatingSystem.current().isMacOsX()) {
+		jvmArgs "--add-exports", "java.desktop/com.apple.eawt=ALL-UNNAMED",
+			"--add-exports", "java.desktop/com.apple.eio=ALL-UNNAMED"
+	}
 	args "--developer-mode", "--debug"
 }
 
