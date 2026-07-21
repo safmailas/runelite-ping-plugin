@@ -79,16 +79,16 @@ public interface PingWorldsConfig extends Config
 	// How it pings (cadence + sampling). These feed the DDoS-safe scheduler in M2/M3.
 	// ---------------------------------------------------------------------------------------------
 
-	@Range(min = 3, max = 60)
+	@Range(min = 1, max = 60)
 	@ConfigItem(
 		keyName = "pingIntervalSeconds",
 		name = "Ping interval (seconds)",
-		description = "Seconds between pings. One world is pinged per interval. A 3s floor is enforced in code for server safety.",
+		description = "Seconds between ping refreshes of your monitored worlds. Lower is snappier. A 1s floor is enforced for server safety.",
 		position = 5
 	)
 	default int pingIntervalSeconds()
 	{
-		return 5;
+		return 2;
 	}
 
 	@Range(min = 1, max = 100)

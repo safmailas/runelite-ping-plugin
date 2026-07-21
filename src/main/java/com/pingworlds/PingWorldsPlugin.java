@@ -7,6 +7,7 @@ import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
@@ -19,12 +20,14 @@ import javax.swing.SwingUtilities;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.client.config.ConfigManager;
+import net.runelite.client.callback.ClientThread;
 import net.runelite.client.game.WorldService;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.worldhopper.ping.Ping;
 import net.runelite.client.ui.ClientToolbar;
 import net.runelite.client.ui.NavigationButton;
+import net.runelite.client.util.WorldUtil;
 import net.runelite.http.api.worlds.World;
 import net.runelite.http.api.worlds.WorldRegion;
 import net.runelite.http.api.worlds.WorldResult;
@@ -38,15 +41,15 @@ import net.runelite.http.api.worlds.WorldResult;
 public class PingWorldsPlugin extends Plugin
 {
 	// Hard guardrails enforced in code no matter what config says. Config can make pinging gentler,
-	// never more aggressive: at least this many seconds between pings, at most this many worlds.
-	private static final int MIN_INTERVAL_SECONDS = 3;
+	// never more aggressive: at least this many seconds between refreshes, at most this many worlds.
+	private static final int MIN_INTERVAL_SECONDS = 1;
 	private static final int MAX_ACTIVE_WORLDS = 8;
 
 	// Worlds at or above this player count are treated as full (matches RuneLite's World Hopper).
 	private static final int FULL_WORLD_PLAYERS = 1950;
 
 	// Small delay before the first ping so the world list has a chance to load after startup.
-	private static final int INITIAL_DELAY_SECONDS = 3;
+	private static final int INITIAL_DELAY_SECONDS = 2;
 
 	@Inject
 	private Client client;
@@ -59,6 +62,9 @@ public class PingWorldsPlugin extends Plugin
 
 	@Inject
 	private ClientToolbar clientToolbar;
+
+	@Inject
+	private ClientThread clientThread;
 
 	private PingWorldsPanel panel;
 	private NavigationButton navButton;
@@ -73,9 +79,6 @@ public class PingWorldsPlugin extends Plugin
 	// concurrent map plus WorldPingStats' own synchronization keeps it safe.
 	private final Map<Integer, WorldPingStats> statsByWorld = new ConcurrentHashMap<>();
 
-	// Round-robin position into the active world set. Only touched on the executor thread.
-	private int cursor;
-
 	@Override
 	protected void startUp()
 	{
@@ -83,7 +86,7 @@ public class PingWorldsPlugin extends Plugin
 
 		// Add the sidebar panel + its nav button (works logged out, so you can pick a world before
 		// logging in).
-		panel = new PingWorldsPanel();
+		panel = new PingWorldsPanel(this::switchToWorld);
 		navButton = NavigationButton.builder()
 			.tooltip("Ping Worlds")
 			.icon(createNavIcon())
@@ -98,7 +101,7 @@ public class PingWorldsPlugin extends Plugin
 
 		int intervalSeconds = Math.max(MIN_INTERVAL_SECONDS, config.pingIntervalSeconds());
 		pingTask = executor.scheduleWithFixedDelay(
-			this::pingNextWorld, INITIAL_DELAY_SECONDS, intervalSeconds, TimeUnit.SECONDS);
+			this::pingActiveWorlds, INITIAL_DELAY_SECONDS, intervalSeconds, TimeUnit.SECONDS);
 	}
 
 	@Override
@@ -124,17 +127,17 @@ public class PingWorldsPlugin extends Plugin
 		panel = null;
 		statsByWorld.clear();
 		lastActive = Collections.emptyList();
-		cursor = 0;
 
 		log.debug("Ping Worlds stopped");
 	}
 
 	/**
-	 * Runs on the background executor thread (never the client thread). Pings ONE world from the
-	 * active set each interval, round-robin, and folds the result into that world's rolling stats.
-	 * Pinging one world per interval (not all at once) is the DDoS-safe guardrail.
+	 * Runs on the background executor thread (never the client thread). Each cycle pings EVERY world
+	 * in the active set (sequentially) and folds each result into that world's rolling stats. The set
+	 * is small (capped at MAX_ACTIVE_WORLDS) and only the user's selected worlds are pinged, so this
+	 * stays gentle while feeling responsive.
 	 */
-	private void pingNextWorld()
+	private void pingActiveWorlds()
 	{
 		try
 		{
@@ -146,40 +149,34 @@ public class PingWorldsPlugin extends Plugin
 
 			List<Integer> active = activeWorldIds(worldResult);
 			lastActive = active;
-			if (active.isEmpty())
-			{
-				updatePanel();
-				return; // nothing selected to ping
-			}
 
-			int worldId = active.get(cursor % active.size());
-			cursor = (cursor + 1) % active.size();
-
-			World world = worldResult.findWorld(worldId);
-			if (world != null)
+			StringBuilder summary = new StringBuilder();
+			for (int worldId : active)
 			{
+				World world = worldResult.findWorld(worldId);
+				if (world == null)
+				{
+					continue;
+				}
 				// true = force a plain TCP-connect ping: portable pure-Java, no native calls.
 				int ping = Ping.ping(world, true);
+				statsByWorld.computeIfAbsent(worldId, id -> new WorldPingStats(config.sampleWindow()))
+					.record(ping);
 
-				WorldPingStats stats = statsByWorld.computeIfAbsent(
-					worldId, id -> new WorldPingStats(config.sampleWindow()));
-				stats.record(ping);
-
-				boolean good = stats.isConsistent(config.avgThresholdMs(), config.jitterThresholdMs());
-				log.debug("World {}: {} (avg {} ms, jitter {} ms, {}) [{} samples]",
-					worldId,
-					ping < 0 ? "timeout" : ping + " ms",
-					stats.average(), stats.jitter(),
-					good ? "OK" : "unstable",
-					stats.sampleCount());
+				if (summary.length() > 0)
+				{
+					summary.append(", ");
+				}
+				summary.append(worldId).append(':').append(ping < 0 ? "x" : ping);
 			}
+			log.debug("Ping cycle [{}]", summary);
 
-			updatePanel();
+			updatePanel(worldResult);
 		}
 		catch (Exception e)
 		{
 			// A thrown task would silently stop the scheduler, so swallow and log instead.
-			log.debug("Ping failed", e);
+			log.debug("Ping cycle failed", e);
 		}
 	}
 
@@ -241,10 +238,11 @@ public class PingWorldsPlugin extends Plugin
 	}
 
 	/**
-	 * Builds the current display model from the active set + rolling stats and pushes it to the panel
-	 * on the Swing thread. Runs on the executor thread; reads only thread-safe state.
+	 * Builds the display model (one row per active world, with region/players/activity + rolling
+	 * stats) and pushes it to the panel on the Swing thread. Rows are sorted best-first: worlds with
+	 * data and the lowest average ping come first. Runs on the executor thread.
 	 */
-	private void updatePanel()
+	private void updatePanel(WorldResult worldResult)
 	{
 		final PingWorldsPanel p = panel;
 		if (p == null)
@@ -252,42 +250,90 @@ public class PingWorldsPlugin extends Plugin
 			return;
 		}
 
-		final List<Integer> active = lastActive;
 		final int avgThreshold = config.avgThresholdMs();
 		final int jitterThreshold = config.jitterThresholdMs();
+		final int currentWorld = client.getWorld();
 
 		final List<WorldStatus> rows = new ArrayList<>();
-		int bestWorld = -1;
-		int bestJitter = Integer.MAX_VALUE;
-		int bestAvg = Integer.MAX_VALUE;
-
-		for (int id : active)
+		for (int id : lastActive)
 		{
+			World world = worldResult.findWorld(id);
+			String activity = world != null && world.getActivity() != null ? world.getActivity() : "";
+			int players = world != null ? world.getPlayers() : -1;
+			String region = world != null ? regionLabel(world.getRegion()) : "";
+
 			WorldPingStats stats = statsByWorld.get(id);
 			if (stats == null || !stats.hasData())
 			{
-				rows.add(new WorldStatus(id, false, 0, 0, 0, false));
-				continue;
+				rows.add(new WorldStatus(id, region, players, activity, false, 0, 0, 0, false));
 			}
-
-			int avg = stats.average();
-			int jitter = stats.jitter();
-			boolean green = stats.isConsistent(avgThreshold, jitterThreshold);
-			rows.add(new WorldStatus(id, true, avg, jitter, stats.sampleCount(), green));
-
-			// Recommend the steadiest green world (lowest jitter, then lowest average).
-			if (green && (jitter < bestJitter || (jitter == bestJitter && avg < bestAvg)))
+			else
 			{
-				bestJitter = jitter;
-				bestAvg = avg;
-				bestWorld = id;
+				boolean green = stats.isConsistent(avgThreshold, jitterThreshold);
+				rows.add(new WorldStatus(id, region, players, activity, true,
+					stats.average(), stats.jitter(), stats.sampleCount(), green));
 			}
 		}
 
-		final int recommended = bestWorld;
-		final String status = config.profile() + " · " + config.region()
-			+ " · " + active.size() + (active.size() == 1 ? " world" : " worlds");
-		SwingUtilities.invokeLater(() -> p.display(rows, recommended, status));
+		// Best-first: worlds with data before those still gathering, then lowest average ping.
+		rows.sort(Comparator
+			.comparing(WorldStatus::hasData).reversed()
+			.thenComparingInt(WorldStatus::getAverage)
+			.thenComparingInt(WorldStatus::getWorldId));
+
+		final String status = config.profile() + " · " + config.region();
+		SwingUtilities.invokeLater(() -> p.display(rows, currentWorld, status));
+	}
+
+	/** Switches (hops) to the given world. Safe to call from the Swing thread. */
+	private void switchToWorld(int worldId)
+	{
+		WorldResult worldResult = worldService.getWorlds();
+		if (worldResult == null)
+		{
+			return;
+		}
+		World world = worldResult.findWorld(worldId);
+		if (world == null)
+		{
+			return;
+		}
+
+		// changeWorld must run on the client thread. Works at the login screen (sets the world you
+		// will log into) and in-game (hops), mirroring RuneLite's own World Hopper.
+		clientThread.invoke(() ->
+		{
+			net.runelite.api.World rsWorld = client.createWorld();
+			rsWorld.setActivity(world.getActivity());
+			rsWorld.setAddress(world.getAddress());
+			rsWorld.setId(world.getId());
+			rsWorld.setLocation(world.getLocation());
+			rsWorld.setPlayerCount(world.getPlayers());
+			rsWorld.setTypes(WorldUtil.toWorldTypes(world.getTypes()));
+			client.changeWorld(rsWorld);
+		});
+	}
+
+	/** Short region code for display, e.g. "US". Empty when unknown. */
+	private static String regionLabel(WorldRegion region)
+	{
+		if (region == null)
+		{
+			return "";
+		}
+		switch (region)
+		{
+			case UNITED_STATES_OF_AMERICA:
+				return "US";
+			case UNITED_KINGDOM:
+				return "UK";
+			case GERMANY:
+				return "DE";
+			case AUSTRALIA:
+				return "AU";
+			default:
+				return region.name().substring(0, Math.min(2, region.name().length()));
+		}
 	}
 
 	/** A simple generated nav-button icon (a green "signal" dot). A polished icon.png comes in M7. */
