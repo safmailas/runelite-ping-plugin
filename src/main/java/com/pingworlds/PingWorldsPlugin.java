@@ -1,6 +1,7 @@
 package com.pingworlds;
 
 import com.google.inject.Provides;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -18,6 +19,7 @@ import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.worldhopper.ping.Ping;
 import net.runelite.http.api.worlds.World;
+import net.runelite.http.api.worlds.WorldRegion;
 import net.runelite.http.api.worlds.WorldResult;
 
 @Slf4j
@@ -32,6 +34,9 @@ public class PingWorldsPlugin extends Plugin
 	// never more aggressive: at least this many seconds between pings, at most this many worlds.
 	private static final int MIN_INTERVAL_SECONDS = 3;
 	private static final int MAX_ACTIVE_WORLDS = 8;
+
+	// Worlds at or above this player count are treated as full (matches RuneLite's World Hopper).
+	private static final int FULL_WORLD_PLAYERS = 1950;
 
 	// Small delay before the first ping so the world list has a chance to load after startup.
 	private static final int INITIAL_DELAY_SECONDS = 3;
@@ -105,7 +110,7 @@ public class PingWorldsPlugin extends Plugin
 				return; // world list not loaded yet
 			}
 
-			List<Integer> active = activeWorldIds();
+			List<Integer> active = activeWorldIds(worldResult);
 			if (active.isEmpty())
 			{
 				return; // nothing selected to ping
@@ -143,28 +148,61 @@ public class PingWorldsPlugin extends Plugin
 	}
 
 	/**
-	 * The worlds to actively ping. Interim source for M3: the user's custom world list, or the
-	 * currently-selected world if that is empty. M4 replaces this with the smart WorldSelector.
+	 * The worlds to actively ping: the smart selector's emptiest-N matches for the current filter,
+	 * always including the selected world. Custom profile falls back to the hand-typed world list.
 	 * Always capped at MAX_ACTIVE_WORLDS regardless of config.
 	 */
-	private List<Integer> activeWorldIds()
+	private List<Integer> activeWorldIds(WorldResult worldResult)
 	{
-		List<Integer> ids = WorldListParser.parse(config.customWorlds());
-		if (ids.isEmpty())
+		int seedId = client.getWorld();
+		int count = Math.min(config.activeWorldCount(), MAX_ACTIVE_WORLDS);
+
+		if (config.profile() == PingProfile.CUSTOM)
 		{
-			int seed = client.getWorld();
-			if (seed > 0)
-			{
-				ids = Collections.singletonList(seed);
-			}
+			return customWorldIds(seedId, count);
 		}
 
-		int cap = Math.min(config.activeWorldCount(), MAX_ACTIVE_WORLDS);
-		if (ids.size() > cap)
+		// Build a pure snapshot the selector can reason about (and that we unit test).
+		List<WorldInfo> infos = new ArrayList<>();
+		for (World w : worldResult.getWorlds())
 		{
-			ids = ids.subList(0, cap);
+			infos.add(new WorldInfo(w.getId(), w.getPlayers(), w.getRegion(), w.getTypes()));
 		}
-		return ids;
+
+		WorldFilter filter = buildFilter(worldResult, seedId);
+		return WorldSelector.select(infos, filter, seedId, count);
+	}
+
+	/**
+	 * Builds the world filter from config. Region AUTO resolves to the region of the currently
+	 * selected world. Profile-specific flags (PvP, Leagues) arrive in M5; for now they are off.
+	 */
+	private WorldFilter buildFilter(WorldResult worldResult, int seedId)
+	{
+		WorldRegion region;
+		if (config.region() == RegionOption.AUTO)
+		{
+			World seed = worldResult.findWorld(seedId);
+			region = seed != null ? seed.getRegion() : null;
+		}
+		else
+		{
+			region = config.region().toWorldRegion();
+		}
+
+		boolean requireMembers = config.accountType() == AccountType.MEMBERS;
+		return new WorldFilter(region, requireMembers, false, false, FULL_WORLD_PLAYERS);
+	}
+
+	/** Custom profile: ping the user's hand-typed world list, or the selected world if it is empty. */
+	private List<Integer> customWorldIds(int seedId, int count)
+	{
+		List<Integer> ids = WorldListParser.parse(config.customWorlds());
+		if (ids.isEmpty() && seedId > 0)
+		{
+			ids = Collections.singletonList(seedId);
+		}
+		return ids.size() > count ? ids.subList(0, count) : ids;
 	}
 
 	@Provides
