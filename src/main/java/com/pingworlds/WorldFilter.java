@@ -1,9 +1,10 @@
 package com.pingworlds;
 
 import net.runelite.http.api.worlds.WorldRegion;
+import net.runelite.http.api.worlds.WorldType;
 
 /**
- * The rules for which worlds are candidates. A play-style profile (M5) is really just a preset
+ * The rules for which worlds are candidates. A play-style profile is really just a preset
  * WorldFilter, so this is the shape that both config and profiles produce.
  */
 public final class WorldFilter
@@ -13,15 +14,23 @@ public final class WorldFilter
 	private final boolean includePvp;      // include PvP / high-risk / deadman / LMS worlds
 	private final boolean includeLeagues;  // include seasonal (Leagues) worlds
 	private final int maxPlayers;          // worlds at or above this are "full" and excluded
+	private final WorldType requiredType;  // null = any; else the world must have this type
 
 	public WorldFilter(WorldRegion region, boolean requireMembers, boolean includePvp,
 		boolean includeLeagues, int maxPlayers)
+	{
+		this(region, requireMembers, includePvp, includeLeagues, maxPlayers, null);
+	}
+
+	public WorldFilter(WorldRegion region, boolean requireMembers, boolean includePvp,
+		boolean includeLeagues, int maxPlayers, WorldType requiredType)
 	{
 		this.region = region;
 		this.requireMembers = requireMembers;
 		this.includePvp = includePvp;
 		this.includeLeagues = includeLeagues;
 		this.maxPlayers = maxPlayers;
+		this.requiredType = requiredType;
 	}
 
 	public WorldRegion getRegion()
@@ -47,5 +56,10 @@ public final class WorldFilter
 	public int getMaxPlayers()
 	{
 		return maxPlayers;
+	}
+
+	public WorldType getRequiredType()
+	{
+		return requiredType;
 	}
 }

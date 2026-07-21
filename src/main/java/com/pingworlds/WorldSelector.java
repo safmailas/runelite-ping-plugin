@@ -97,6 +97,11 @@ public final class WorldSelector
 			return false; // wrong region (a null world region never matches a specific target)
 		}
 
+		if (f.getRequiredType() != null && !w.hasType(f.getRequiredType()))
+		{
+			return false; // profile requires a specific world type (e.g. Leagues = SEASONAL)
+		}
+
 		if (!f.isIncludePvp() && intersects(w, PVP_TYPES))
 		{
 			return false;

@@ -174,8 +174,8 @@ public class PingWorldsPlugin extends Plugin
 	}
 
 	/**
-	 * Builds the world filter from config. Region AUTO resolves to the region of the currently
-	 * selected world. Profile-specific flags (PvP, Leagues) arrive in M5; for now they are off.
+	 * Builds the world filter from config: the selected play-style profile provides the rules, and
+	 * region AUTO resolves to the region of the currently selected world.
 	 */
 	private WorldFilter buildFilter(WorldResult worldResult, int seedId)
 	{
@@ -190,8 +190,7 @@ public class PingWorldsPlugin extends Plugin
 			region = config.region().toWorldRegion();
 		}
 
-		boolean requireMembers = config.accountType() == AccountType.MEMBERS;
-		return new WorldFilter(region, requireMembers, false, false, FULL_WORLD_PLAYERS);
+		return ProfileFilter.forProfile(config.profile(), region, config.accountType(), FULL_WORLD_PLAYERS);
 	}
 
 	/** Custom profile: ping the user's hand-typed world list, or the selected world if it is empty. */
