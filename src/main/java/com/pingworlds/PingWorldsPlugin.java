@@ -1,6 +1,10 @@
 package com.pingworlds;
 
 import com.google.inject.Provides;
+import java.util.Collections;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -24,9 +28,10 @@ import net.runelite.http.api.worlds.WorldResult;
 )
 public class PingWorldsPlugin extends Plugin
 {
-	// Hard floor enforced in code no matter what config says — a guardrail the plugin must never
-	// forget. Config can make pinging gentler (higher interval), never more aggressive than this.
+	// Hard guardrails enforced in code no matter what config says. Config can make pinging gentler,
+	// never more aggressive: at least this many seconds between pings, at most this many worlds.
 	private static final int MIN_INTERVAL_SECONDS = 3;
+	private static final int MAX_ACTIVE_WORLDS = 8;
 
 	// Small delay before the first ping so the world list has a chance to load after startup.
 	private static final int INITIAL_DELAY_SECONDS = 3;
@@ -43,6 +48,13 @@ public class PingWorldsPlugin extends Plugin
 	private ScheduledExecutorService executor;
 	private ScheduledFuture<?> pingTask;
 
+	// Per-world rolling stats. Written on the executor thread, read from the Swing thread (M6), so a
+	// concurrent map plus WorldPingStats' own synchronization keeps it safe.
+	private final Map<Integer, WorldPingStats> statsByWorld = new ConcurrentHashMap<>();
+
+	// Round-robin position into the active world set. Only touched on the executor thread.
+	private int cursor;
+
 	@Override
 	protected void startUp()
 	{
@@ -54,7 +66,7 @@ public class PingWorldsPlugin extends Plugin
 
 		int intervalSeconds = Math.max(MIN_INTERVAL_SECONDS, config.pingIntervalSeconds());
 		pingTask = executor.scheduleWithFixedDelay(
-			this::pingSeedWorld, INITIAL_DELAY_SECONDS, intervalSeconds, TimeUnit.SECONDS);
+			this::pingNextWorld, INITIAL_DELAY_SECONDS, intervalSeconds, TimeUnit.SECONDS);
 	}
 
 	@Override
@@ -72,34 +84,35 @@ public class PingWorldsPlugin extends Plugin
 			executor.shutdownNow();
 			executor = null;
 		}
+		statsByWorld.clear();
+		cursor = 0;
 
 		log.debug("Ping Worlds stopped");
 	}
 
 	/**
-	 * Runs on the background executor thread (never the client thread). Pings the world RuneLite
-	 * currently has selected and logs the round-trip time. In M3 this becomes a round-robin over a
-	 * smart-selected set of worlds.
+	 * Runs on the background executor thread (never the client thread). Pings ONE world from the
+	 * active set each interval, round-robin, and folds the result into that world's rolling stats.
+	 * Pinging one world per interval (not all at once) is the DDoS-safe guardrail.
 	 */
-	private void pingSeedWorld()
+	private void pingNextWorld()
 	{
 		try
 		{
-			// Lightweight read of the currently-selected world. At the login screen this is the
-			// world shown in the login world switcher, so we can ping before logging in.
-			int worldId = client.getWorld();
-			if (worldId <= 0)
-			{
-				return; // no world selected yet
-			}
-
-			// getWorlds() is cached and may be null until the first fetch completes. Safe to block
-			// here because we are on the background thread, not the client thread.
 			WorldResult worldResult = worldService.getWorlds();
 			if (worldResult == null)
 			{
 				return; // world list not loaded yet
 			}
+
+			List<Integer> active = activeWorldIds();
+			if (active.isEmpty())
+			{
+				return; // nothing selected to ping
+			}
+
+			int worldId = active.get(cursor % active.size());
+			cursor = (cursor + 1) % active.size();
 
 			World world = worldResult.findWorld(worldId);
 			if (world == null)
@@ -109,14 +122,49 @@ public class PingWorldsPlugin extends Plugin
 
 			// true = force a plain TCP-connect ping: portable pure-Java, no native calls in our code.
 			int ping = Ping.ping(world, true);
-			String result = ping < 0 ? "timeout" : ping + " ms";
-			log.debug("Ping to world {}: {}", worldId, result);
+
+			WorldPingStats stats = statsByWorld.computeIfAbsent(
+				worldId, id -> new WorldPingStats(config.sampleWindow()));
+			stats.record(ping);
+
+			boolean good = stats.isConsistent(config.avgThresholdMs(), config.jitterThresholdMs());
+			log.debug("World {}: {} (avg {} ms, jitter {} ms, {}) [{} samples]",
+				worldId,
+				ping < 0 ? "timeout" : ping + " ms",
+				stats.average(), stats.jitter(),
+				good ? "OK" : "unstable",
+				stats.sampleCount());
 		}
 		catch (Exception e)
 		{
 			// A thrown task would silently stop the scheduler, so swallow and log instead.
 			log.debug("Ping failed", e);
 		}
+	}
+
+	/**
+	 * The worlds to actively ping. Interim source for M3: the user's custom world list, or the
+	 * currently-selected world if that is empty. M4 replaces this with the smart WorldSelector.
+	 * Always capped at MAX_ACTIVE_WORLDS regardless of config.
+	 */
+	private List<Integer> activeWorldIds()
+	{
+		List<Integer> ids = WorldListParser.parse(config.customWorlds());
+		if (ids.isEmpty())
+		{
+			int seed = client.getWorld();
+			if (seed > 0)
+			{
+				ids = Collections.singletonList(seed);
+			}
+		}
+
+		int cap = Math.min(config.activeWorldCount(), MAX_ACTIVE_WORLDS);
+		if (ids.size() > cap)
+		{
+			ids = ids.subList(0, cap);
+		}
+		return ids;
 	}
 
 	@Provides
