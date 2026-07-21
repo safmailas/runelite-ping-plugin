@@ -1,6 +1,10 @@
 package com.pingworlds;
 
 import com.google.inject.Provides;
+import java.awt.Color;
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
+import java.awt.image.BufferedImage;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -11,6 +15,7 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import javax.inject.Inject;
+import javax.swing.SwingUtilities;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
 import net.runelite.client.config.ConfigManager;
@@ -18,6 +23,8 @@ import net.runelite.client.game.WorldService;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
 import net.runelite.client.plugins.worldhopper.ping.Ping;
+import net.runelite.client.ui.ClientToolbar;
+import net.runelite.client.ui.NavigationButton;
 import net.runelite.http.api.worlds.World;
 import net.runelite.http.api.worlds.WorldRegion;
 import net.runelite.http.api.worlds.WorldResult;
@@ -50,6 +57,15 @@ public class PingWorldsPlugin extends Plugin
 	@Inject
 	private PingWorldsConfig config;
 
+	@Inject
+	private ClientToolbar clientToolbar;
+
+	private PingWorldsPanel panel;
+	private NavigationButton navButton;
+
+	// The most recently computed active set, published for the panel to read.
+	private volatile List<Integer> lastActive = Collections.emptyList();
+
 	private ScheduledExecutorService executor;
 	private ScheduledFuture<?> pingTask;
 
@@ -64,6 +80,17 @@ public class PingWorldsPlugin extends Plugin
 	protected void startUp()
 	{
 		log.debug("Ping Worlds started");
+
+		// Add the sidebar panel + its nav button (works logged out, so you can pick a world before
+		// logging in).
+		panel = new PingWorldsPanel();
+		navButton = NavigationButton.builder()
+			.tooltip("Ping Worlds")
+			.icon(createNavIcon())
+			.priority(7)
+			.panel(panel)
+			.build();
+		clientToolbar.addNavigation(navButton);
 
 		// A single background thread. Pings are blocking network IO, which must NEVER run on the
 		// game (client) thread — that would freeze RuneLite's UI.
@@ -89,7 +116,14 @@ public class PingWorldsPlugin extends Plugin
 			executor.shutdownNow();
 			executor = null;
 		}
+		if (navButton != null)
+		{
+			clientToolbar.removeNavigation(navButton);
+			navButton = null;
+		}
+		panel = null;
 		statsByWorld.clear();
+		lastActive = Collections.emptyList();
 		cursor = 0;
 
 		log.debug("Ping Worlds stopped");
@@ -111,8 +145,10 @@ public class PingWorldsPlugin extends Plugin
 			}
 
 			List<Integer> active = activeWorldIds(worldResult);
+			lastActive = active;
 			if (active.isEmpty())
 			{
+				updatePanel();
 				return; // nothing selected to ping
 			}
 
@@ -120,25 +156,25 @@ public class PingWorldsPlugin extends Plugin
 			cursor = (cursor + 1) % active.size();
 
 			World world = worldResult.findWorld(worldId);
-			if (world == null)
+			if (world != null)
 			{
-				return; // unknown world number
+				// true = force a plain TCP-connect ping: portable pure-Java, no native calls.
+				int ping = Ping.ping(world, true);
+
+				WorldPingStats stats = statsByWorld.computeIfAbsent(
+					worldId, id -> new WorldPingStats(config.sampleWindow()));
+				stats.record(ping);
+
+				boolean good = stats.isConsistent(config.avgThresholdMs(), config.jitterThresholdMs());
+				log.debug("World {}: {} (avg {} ms, jitter {} ms, {}) [{} samples]",
+					worldId,
+					ping < 0 ? "timeout" : ping + " ms",
+					stats.average(), stats.jitter(),
+					good ? "OK" : "unstable",
+					stats.sampleCount());
 			}
 
-			// true = force a plain TCP-connect ping: portable pure-Java, no native calls in our code.
-			int ping = Ping.ping(world, true);
-
-			WorldPingStats stats = statsByWorld.computeIfAbsent(
-				worldId, id -> new WorldPingStats(config.sampleWindow()));
-			stats.record(ping);
-
-			boolean good = stats.isConsistent(config.avgThresholdMs(), config.jitterThresholdMs());
-			log.debug("World {}: {} (avg {} ms, jitter {} ms, {}) [{} samples]",
-				worldId,
-				ping < 0 ? "timeout" : ping + " ms",
-				stats.average(), stats.jitter(),
-				good ? "OK" : "unstable",
-				stats.sampleCount());
+			updatePanel();
 		}
 		catch (Exception e)
 		{
@@ -202,6 +238,68 @@ public class PingWorldsPlugin extends Plugin
 			ids = Collections.singletonList(seedId);
 		}
 		return ids.size() > count ? ids.subList(0, count) : ids;
+	}
+
+	/**
+	 * Builds the current display model from the active set + rolling stats and pushes it to the panel
+	 * on the Swing thread. Runs on the executor thread; reads only thread-safe state.
+	 */
+	private void updatePanel()
+	{
+		final PingWorldsPanel p = panel;
+		if (p == null)
+		{
+			return;
+		}
+
+		final List<Integer> active = lastActive;
+		final int avgThreshold = config.avgThresholdMs();
+		final int jitterThreshold = config.jitterThresholdMs();
+
+		final List<WorldStatus> rows = new ArrayList<>();
+		int bestWorld = -1;
+		int bestJitter = Integer.MAX_VALUE;
+		int bestAvg = Integer.MAX_VALUE;
+
+		for (int id : active)
+		{
+			WorldPingStats stats = statsByWorld.get(id);
+			if (stats == null || !stats.hasData())
+			{
+				rows.add(new WorldStatus(id, false, 0, 0, 0, false));
+				continue;
+			}
+
+			int avg = stats.average();
+			int jitter = stats.jitter();
+			boolean green = stats.isConsistent(avgThreshold, jitterThreshold);
+			rows.add(new WorldStatus(id, true, avg, jitter, stats.sampleCount(), green));
+
+			// Recommend the steadiest green world (lowest jitter, then lowest average).
+			if (green && (jitter < bestJitter || (jitter == bestJitter && avg < bestAvg)))
+			{
+				bestJitter = jitter;
+				bestAvg = avg;
+				bestWorld = id;
+			}
+		}
+
+		final int recommended = bestWorld;
+		final String status = config.profile() + " · " + config.region()
+			+ " · " + active.size() + (active.size() == 1 ? " world" : " worlds");
+		SwingUtilities.invokeLater(() -> p.display(rows, recommended, status));
+	}
+
+	/** A simple generated nav-button icon (a green "signal" dot). A polished icon.png comes in M7. */
+	private static BufferedImage createNavIcon()
+	{
+		BufferedImage image = new BufferedImage(24, 24, BufferedImage.TYPE_INT_ARGB);
+		Graphics2D g = image.createGraphics();
+		g.setRenderingHint(RenderingHints.KEY_ANTIALIASING, RenderingHints.VALUE_ANTIALIAS_ON);
+		g.setColor(new Color(76, 175, 80));
+		g.fillOval(5, 5, 14, 14);
+		g.dispose();
+		return image;
 	}
 
 	@Provides
