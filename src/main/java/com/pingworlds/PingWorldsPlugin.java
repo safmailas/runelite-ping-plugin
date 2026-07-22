@@ -219,13 +219,11 @@ public class PingWorldsPlugin extends Plugin
 		World world = worldResult.findWorld(worldId);
 		if (world != null)
 		{
-			// true = force a plain TCP-connect ping: portable pure-Java, no native calls.
+			// Reuse RuneLite World Hopper's ping: native ICMP first, TCP-connect fallback if it fails
+			// (the true flag). The native code lives in runelite-client, so our plugin uses no JNA.
 			int ping = Ping.ping(world, true);
 			statsByWorld.computeIfAbsent(worldId, id -> new WorldPingStats(config.sampleWindow()))
 				.record(ping);
-			log.debug("ping w{} = {} ({} eligible, batch {}/{})",
-				worldId, ping < 0 ? "timeout" : ping + "ms",
-				sweepOrder.size(), batchIndex + 1, (sweepOrder.size() + BATCH_SIZE - 1) / BATCH_SIZE);
 		}
 
 		advanceSweep(batchSize);
