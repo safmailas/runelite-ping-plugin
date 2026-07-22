@@ -62,8 +62,10 @@ public class ProfileFilterTest
 	{
 		WorldFilter f = ProfileFilter.forProfile(PingProfile.LEAGUES, US, AccountType.MEMBERS, 1950);
 		List<WorldInfo> all = Arrays.asList(
-			new WorldInfo(301, 100, US, EnumSet.of(WorldType.MEMBERS)),                       // normal
-			new WorldInfo(302, 200, US, EnumSet.of(WorldType.MEMBERS, WorldType.SEASONAL)));   // leagues
+			// A normal world (no activity = generic in OSRS); excluded because it is not SEASONAL.
+			new WorldInfo(301, 100, US, "", EnumSet.of(WorldType.MEMBERS)),
+			// A Leagues world (SEASONAL); this is the only one the Leagues profile should keep.
+			new WorldInfo(302, 200, US, "", EnumSet.of(WorldType.MEMBERS, WorldType.SEASONAL)));
 		assertEquals(Collections.singletonList(302), WorldSelector.select(all, f, 0, 5));
 	}
 }

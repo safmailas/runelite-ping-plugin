@@ -63,40 +63,28 @@ public interface PingWorldsConfig extends Config
 		return "";
 	}
 
-	@Range(min = 1, max = 8)
+	@Range(min = 3, max = 20)
 	@ConfigItem(
 		keyName = "activeWorldCount",
-		name = "Worlds to monitor",
-		description = "How many worlds to actively ping (the emptiest matches are auto-picked). Capped at 8 for server safety.",
+		name = "Worlds to show",
+		description = "How many worlds to list in the panel (best-first). All eligible worlds are still scanned for ping/jitter in the background.",
 		position = 4
 	)
-	default int activeWorldCount()
+	default int worldsToShow()
 	{
-		return 5;
+		return 10;
 	}
 
 	// ---------------------------------------------------------------------------------------------
-	// How it pings (cadence + sampling). These feed the DDoS-safe scheduler in M2/M3.
+	// Sampling. How many recent pings define a world's average + jitter.
 	// ---------------------------------------------------------------------------------------------
 
-	@Range(min = 1, max = 60)
-	@ConfigItem(
-		keyName = "pingIntervalSeconds",
-		name = "Ping interval (seconds)",
-		description = "Seconds between ping refreshes of your monitored worlds. Lower is snappier. A 1s floor is enforced for server safety.",
-		position = 5
-	)
-	default int pingIntervalSeconds()
-	{
-		return 2;
-	}
-
-	@Range(min = 1, max = 100)
+	@Range(min = 3, max = 100)
 	@ConfigItem(
 		keyName = "sampleWindow",
 		name = "Samples per world",
-		description = "How many recent pings to average per world.",
-		position = 6
+		description = "How many recent pings to average per world (also drives the jitter estimate).",
+		position = 5
 	)
 	default int sampleWindow()
 	{

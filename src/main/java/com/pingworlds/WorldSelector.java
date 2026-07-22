@@ -74,16 +74,12 @@ public final class WorldSelector
 		return new ArrayList<>(result);
 	}
 
-	/** True if a world passes the filter (public-ish for direct testing). */
+	/** True if a world passes the full filter (region + members + type rules). */
 	static boolean passes(WorldInfo w, WorldFilter f)
 	{
-		if (w.getPlayers() < 0)
+		if (!eligible(w, f))
 		{
-			return false; // offline
-		}
-		if (w.getPlayers() >= f.getMaxPlayers())
-		{
-			return false; // full
+			return false;
 		}
 
 		boolean isMembers = w.hasType(WorldType.MEMBERS);
@@ -97,11 +93,28 @@ public final class WorldSelector
 			return false; // wrong region (a null world region never matches a specific target)
 		}
 
+		return true;
+	}
+
+	/**
+	 * True if a world is online and passes only the TYPE rules (full/offline, required type, PvP,
+	 * Leagues, special) — ignoring region and members. Used by the full sweep, which scans every
+	 * region and both member/f2p subgroups (ordering handles relevance, not filtering).
+	 */
+	static boolean eligible(WorldInfo w, WorldFilter f)
+	{
+		if (w.getPlayers() < 0)
+		{
+			return false; // offline
+		}
+		if (w.isGeneric() && w.getPlayers() >= f.getMaxPlayers())
+		{
+			return false; // full — but only for generic worlds; keep busy activity worlds (e.g. Trade)
+		}
 		if (f.getRequiredType() != null && !w.hasType(f.getRequiredType()))
 		{
 			return false; // profile requires a specific world type (e.g. Leagues = SEASONAL)
 		}
-
 		if (!f.isIncludePvp() && intersects(w, PVP_TYPES))
 		{
 			return false;
@@ -114,7 +127,6 @@ public final class WorldSelector
 		{
 			return false;
 		}
-
 		return true;
 	}
 

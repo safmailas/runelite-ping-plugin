@@ -30,10 +30,15 @@ public class WorldSelectorTest
 
 	private static WorldInfo w(int id, int players, WorldRegion region, WorldType... types)
 	{
+		return world(id, players, region, "", types); // generic (no activity) by default
+	}
+
+	private static WorldInfo world(int id, int players, WorldRegion region, String activity, WorldType... types)
+	{
 		Set<WorldType> set = types.length == 0
 			? EnumSet.noneOf(WorldType.class)
 			: EnumSet.copyOf(Arrays.asList(types));
-		return new WorldInfo(id, players, region, set);
+		return new WorldInfo(id, players, region, activity, set);
 	}
 
 	@Test
@@ -51,6 +56,24 @@ public class WorldSelectorTest
 	{
 		List<WorldInfo> all = Arrays.asList(
 			w(301, 1950, US, WorldType.MEMBERS),   // full
+			w(302, 100, US, WorldType.MEMBERS));
+		assertEquals(Collections.singletonList(302), WorldSelector.select(all, membersUs(), 0, 5));
+	}
+
+	@Test
+	public void keepsFullWorldsThatHaveAnActivity()
+	{
+		List<WorldInfo> all = Arrays.asList(
+			world(301, 1980, US, "Trade - Members", WorldType.MEMBERS), // full but non-generic -> kept
+			w(302, 100, US, WorldType.MEMBERS));
+		assertEquals(Arrays.asList(302, 301), WorldSelector.select(all, membersUs(), 0, 5));
+	}
+
+	@Test
+	public void excludesGenericFullWorlds()
+	{
+		List<WorldInfo> all = Arrays.asList(
+			world(301, 1980, US, "", WorldType.MEMBERS), // full AND generic -> excluded
 			w(302, 100, US, WorldType.MEMBERS));
 		assertEquals(Collections.singletonList(302), WorldSelector.select(all, membersUs(), 0, 5));
 	}

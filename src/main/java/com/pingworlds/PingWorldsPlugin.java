@@ -8,8 +8,10 @@ import java.awt.image.BufferedImage;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -19,8 +21,8 @@ import javax.inject.Inject;
 import javax.swing.SwingUtilities;
 import lombok.extern.slf4j.Slf4j;
 import net.runelite.api.Client;
-import net.runelite.client.config.ConfigManager;
 import net.runelite.client.callback.ClientThread;
+import net.runelite.client.config.ConfigManager;
 import net.runelite.client.game.WorldService;
 import net.runelite.client.plugins.Plugin;
 import net.runelite.client.plugins.PluginDescriptor;
@@ -31,25 +33,32 @@ import net.runelite.client.util.WorldUtil;
 import net.runelite.http.api.worlds.World;
 import net.runelite.http.api.worlds.WorldRegion;
 import net.runelite.http.api.worlds.WorldResult;
+import net.runelite.http.api.worlds.WorldType;
 
 @Slf4j
 @PluginDescriptor(
 	name = "Ping Worlds",
-	description = "Ping a smart, context-filtered set of worlds and see which are best to log into",
-	tags = {"ping", "world", "latency", "login", "hop"}
+	description = "Scan worlds for ping and jitter and see which are the most stable to log into",
+	tags = {"ping", "world", "latency", "login", "hop", "jitter"}
 )
 public class PingWorldsPlugin extends Plugin
 {
-	// Hard guardrails enforced in code no matter what config says. Config can make pinging gentler,
-	// never more aggressive: at least this many seconds between refreshes, at most this many worlds.
-	private static final int MIN_INTERVAL_SECONDS = 1;
-	private static final int MAX_ACTIVE_WORLDS = 8;
-
 	// Worlds at or above this player count are treated as full (matches RuneLite's World Hopper).
 	private static final int FULL_WORLD_PLAYERS = 1950;
 
 	// Small delay before the first ping so the world list has a chance to load after startup.
 	private static final int INITIAL_DELAY_SECONDS = 2;
+
+	// The sweep: process worlds in batches; ping each world in a batch this many times (rounds) before
+	// moving to the next batch, and don't revisit a batch until the whole sweep has finished.
+	private static final int BATCH_SIZE = 10;
+	private static final int ROUNDS_PER_BATCH = 5;
+
+	// Steady, gentle spacing between individual pings (~5 pings/second, to varied servers).
+	private static final int PING_SPACING_MS = 200;
+
+	// Don't rebuild the panel more often than this (the sweep ticks several times a second).
+	private static final long PANEL_REFRESH_MS = 500;
 
 	@Inject
 	private Client client;
@@ -69,23 +78,30 @@ public class PingWorldsPlugin extends Plugin
 	private PingWorldsPanel panel;
 	private NavigationButton navButton;
 
-	// The most recently computed active set, published for the panel to read.
-	private volatile List<Integer> lastActive = Collections.emptyList();
-
 	private ScheduledExecutorService executor;
 	private ScheduledFuture<?> pingTask;
 
-	// Per-world rolling stats. Written on the executor thread, read from the Swing thread (M6), so a
+	// Per-world rolling stats. Written on the executor thread, read from the Swing thread, so a
 	// concurrent map plus WorldPingStats' own synchronization keeps it safe.
 	private final Map<Integer, WorldPingStats> statsByWorld = new ConcurrentHashMap<>();
+
+	// Worlds the user explicitly clicked. Written from the Swing thread, read from the executor
+	// thread, so it is synchronized; insertion order preserved.
+	private final Set<Integer> pinned = Collections.synchronizedSet(new LinkedHashSet<>());
+
+	// Sweep state — only touched on the executor thread.
+	private final List<Integer> sweepOrder = new ArrayList<>();
+	private int batchIndex;
+	private int roundIndex;
+	private int posInBatch;
+	private long lastPanelUpdateMs;
 
 	@Override
 	protected void startUp()
 	{
 		log.debug("Ping Worlds started");
 
-		// Add the sidebar panel + its nav button (works logged out, so you can pick a world before
-		// logging in).
+		// Sidebar panel + nav button (works logged out, so you can pick a world before logging in).
 		panel = new PingWorldsPanel(this::switchToWorld);
 		navButton = NavigationButton.builder()
 			.tooltip("Ping Worlds")
@@ -98,10 +114,7 @@ public class PingWorldsPlugin extends Plugin
 		// A single background thread. Pings are blocking network IO, which must NEVER run on the
 		// game (client) thread — that would freeze RuneLite's UI.
 		executor = Executors.newSingleThreadScheduledExecutor();
-
-		int intervalSeconds = Math.max(MIN_INTERVAL_SECONDS, config.pingIntervalSeconds());
-		pingTask = executor.scheduleWithFixedDelay(
-			this::pingActiveWorlds, INITIAL_DELAY_SECONDS, intervalSeconds, TimeUnit.SECONDS);
+		pingTask = executor.schedule(this::tick, INITIAL_DELAY_SECONDS, TimeUnit.SECONDS);
 	}
 
 	@Override
@@ -126,84 +139,167 @@ public class PingWorldsPlugin extends Plugin
 		}
 		panel = null;
 		statsByWorld.clear();
-		lastActive = Collections.emptyList();
+		pinned.clear();
+		sweepOrder.clear();
+		batchIndex = 0;
+		roundIndex = 0;
+		posInBatch = 0;
 
 		log.debug("Ping Worlds stopped");
 	}
 
-	/**
-	 * Runs on the background executor thread (never the client thread). Each cycle pings EVERY world
-	 * in the active set (sequentially) and folds each result into that world's rolling stats. The set
-	 * is small (capped at MAX_ACTIVE_WORLDS) and only the user's selected worlds are pinged, so this
-	 * stays gentle while feeling responsive.
-	 */
-	private void pingActiveWorlds()
+	/** One scheduler tick: ping a single world, then schedule the next tick a steady spacing later. */
+	private void tick()
 	{
 		try
 		{
-			WorldResult worldResult = worldService.getWorlds();
-			if (worldResult == null)
-			{
-				return; // world list not loaded yet
-			}
-
-			List<Integer> active = activeWorldIds(worldResult);
-			lastActive = active;
-
-			StringBuilder summary = new StringBuilder();
-			for (int worldId : active)
-			{
-				World world = worldResult.findWorld(worldId);
-				if (world == null)
-				{
-					continue;
-				}
-				// true = force a plain TCP-connect ping: portable pure-Java, no native calls.
-				int ping = Ping.ping(world, true);
-				statsByWorld.computeIfAbsent(worldId, id -> new WorldPingStats(config.sampleWindow()))
-					.record(ping);
-
-				if (summary.length() > 0)
-				{
-					summary.append(", ");
-				}
-				summary.append(worldId).append(':').append(ping < 0 ? "x" : ping);
-			}
-			log.debug("Ping cycle [{}]", summary);
-
-			updatePanel(worldResult);
+			sweepStep();
 		}
 		catch (Exception e)
 		{
 			// A thrown task would silently stop the scheduler, so swallow and log instead.
-			log.debug("Ping cycle failed", e);
+			log.debug("Sweep step failed", e);
+		}
+		finally
+		{
+			ScheduledExecutorService ex = executor;
+			if (ex != null && !ex.isShutdown())
+			{
+				pingTask = ex.schedule(this::tick, PING_SPACING_MS, TimeUnit.MILLISECONDS);
+			}
 		}
 	}
 
 	/**
-	 * The worlds to actively ping: the smart selector's emptiest-N matches for the current filter,
-	 * always including the selected world. Custom profile falls back to the hand-typed world list.
-	 * Always capped at MAX_ACTIVE_WORLDS regardless of config.
+	 * Runs on the executor thread (never the client thread). Pings ONE world, advancing through the
+	 * relevance-ordered sweep in batches: each world is pinged {@link #ROUNDS_PER_BATCH} times within
+	 * its batch before we move on, and a batch is not revisited until the whole sweep completes.
 	 */
-	private List<Integer> activeWorldIds(WorldResult worldResult)
+	private void sweepStep()
 	{
-		int seedId = client.getWorld();
-		int count = Math.min(config.activeWorldCount(), MAX_ACTIVE_WORLDS);
+		WorldResult worldResult = worldService.getWorlds();
+		if (worldResult == null)
+		{
+			return; // world list not loaded yet
+		}
+
+		if (sweepOrder.isEmpty())
+		{
+			rebuildSweep(worldResult);
+		}
+		if (sweepOrder.isEmpty())
+		{
+			maybeUpdatePanel(worldResult);
+			return;
+		}
+
+		int total = sweepOrder.size();
+		int batchCount = (total + BATCH_SIZE - 1) / BATCH_SIZE;
+		if (batchIndex >= batchCount)
+		{
+			// Full sweep complete — rebuild (worlds / pins / populations may have changed) and restart.
+			rebuildSweep(worldResult);
+			if (sweepOrder.isEmpty())
+			{
+				maybeUpdatePanel(worldResult);
+				return;
+			}
+			total = sweepOrder.size();
+			batchCount = (total + BATCH_SIZE - 1) / BATCH_SIZE;
+		}
+
+		int batchStart = batchIndex * BATCH_SIZE;
+		int batchSize = Math.min(BATCH_SIZE, total - batchStart);
+		if (posInBatch >= batchSize)
+		{
+			posInBatch = 0;
+		}
+
+		int worldId = sweepOrder.get(batchStart + posInBatch);
+		World world = worldResult.findWorld(worldId);
+		if (world != null)
+		{
+			// true = force a plain TCP-connect ping: portable pure-Java, no native calls.
+			int ping = Ping.ping(world, true);
+			statsByWorld.computeIfAbsent(worldId, id -> new WorldPingStats(config.sampleWindow()))
+				.record(ping);
+			log.debug("ping w{} = {} ({} eligible, batch {}/{})",
+				worldId, ping < 0 ? "timeout" : ping + "ms",
+				sweepOrder.size(), batchIndex + 1, (sweepOrder.size() + BATCH_SIZE - 1) / BATCH_SIZE);
+		}
+
+		advanceSweep(batchSize);
+		maybeUpdatePanel(worldResult);
+	}
+
+	private void advanceSweep(int batchSize)
+	{
+		posInBatch++;
+		if (posInBatch >= batchSize)
+		{
+			posInBatch = 0;
+			roundIndex++;
+			if (roundIndex >= ROUNDS_PER_BATCH)
+			{
+				roundIndex = 0;
+				batchIndex++; // next step rebuilds/restarts if this passes the last batch
+			}
+		}
+	}
+
+	/**
+	 * Rebuilds the relevance-ordered sweep list: the current world and any pinned worlds first, then
+	 * every eligible world (all regions, both member/f2p subgroups) ordered by your region, then your
+	 * account subgroup, then emptiest. Resets the sweep position.
+	 */
+	private void rebuildSweep(WorldResult worldResult)
+	{
+		sweepOrder.clear();
+		batchIndex = 0;
+		roundIndex = 0;
+		posInBatch = 0;
+
+		int current = client.getWorld();
+		LinkedHashSet<Integer> order = new LinkedHashSet<>();
+		if (current > 0)
+		{
+			order.add(current);
+		}
+		synchronized (pinned)
+		{
+			order.addAll(pinned);
+		}
 
 		if (config.profile() == PingProfile.CUSTOM)
 		{
-			return customWorldIds(seedId, count);
+			order.addAll(WorldListParser.parse(config.customWorlds()));
+			sweepOrder.addAll(order);
+			return;
 		}
 
-		// Build a pure snapshot the selector can reason about (and that we unit test).
-		List<WorldInfo> infos = new ArrayList<>();
+		WorldFilter filter = buildFilter(worldResult, current);
+		WorldRegion myRegion = filter.getRegion();
+		boolean membersPref = config.accountType() == AccountType.MEMBERS;
+
+		List<World> eligible = new ArrayList<>();
 		for (World w : worldResult.getWorlds())
 		{
-			infos.add(new WorldInfo(w.getId(), w.getPlayers(), w.getRegion(), w.getTypes()));
+			WorldInfo info = new WorldInfo(w.getId(), w.getPlayers(), w.getRegion(), w.getActivity(), w.getTypes());
+			if (WorldSelector.eligible(info, filter))
+			{
+				eligible.add(w);
+			}
 		}
+		eligible.sort(Comparator
+			.comparing((World w) -> !(myRegion != null && w.getRegion() == myRegion)) // your region first
+			.thenComparing((World w) -> membersPref != w.getTypes().contains(WorldType.MEMBERS)) // your subgroup first
+			.thenComparingInt(World::getPlayers)); // emptiest first within each group
 
-		WorldFilter filter = buildFilter(worldResult, seedId);
-		return WorldSelector.select(infos, filter, seedId, count);
+		for (World w : eligible)
+		{
+			order.add(w.getId());
+		}
+		sweepOrder.addAll(order);
 	}
 
 	/**
@@ -226,21 +322,20 @@ public class PingWorldsPlugin extends Plugin
 		return ProfileFilter.forProfile(config.profile(), region, config.accountType(), FULL_WORLD_PLAYERS);
 	}
 
-	/** Custom profile: ping the user's hand-typed world list, or the selected world if it is empty. */
-	private List<Integer> customWorldIds(int seedId, int count)
+	private void maybeUpdatePanel(WorldResult worldResult)
 	{
-		List<Integer> ids = WorldListParser.parse(config.customWorlds());
-		if (ids.isEmpty() && seedId > 0)
+		long now = System.currentTimeMillis();
+		if (now - lastPanelUpdateMs >= PANEL_REFRESH_MS)
 		{
-			ids = Collections.singletonList(seedId);
+			lastPanelUpdateMs = now;
+			updatePanel(worldResult);
 		}
-		return ids.size() > count ? ids.subList(0, count) : ids;
 	}
 
 	/**
-	 * Builds the display model (one row per active world, with region/players/activity + rolling
-	 * stats) and pushes it to the panel on the Swing thread. Rows are sorted best-first: worlds with
-	 * data and the lowest average ping come first. Runs on the executor thread.
+	 * Builds the display model — the current world, pinned worlds, and the best profile-relevant
+	 * worlds (up to the configured count) — and pushes it to the panel on the Swing thread, sorted
+	 * best-first. Runs on the executor thread.
 	 */
 	private void updatePanel(WorldResult worldResult)
 	{
@@ -250,42 +345,98 @@ public class PingWorldsPlugin extends Plugin
 			return;
 		}
 
-		final int avgThreshold = config.avgThresholdMs();
-		final int jitterThreshold = config.jitterThresholdMs();
-		final int currentWorld = client.getWorld();
+		final int avgT = config.avgThresholdMs();
+		final int jitT = config.jitterThresholdMs();
+		final int current = client.getWorld();
+		final int limit = config.worldsToShow();
 
-		final List<WorldStatus> rows = new ArrayList<>();
-		for (int id : lastActive)
+		LinkedHashSet<Integer> shown = new LinkedHashSet<>();
+		if (current > 0)
 		{
-			World world = worldResult.findWorld(id);
-			String activity = world != null && world.getActivity() != null ? world.getActivity() : "";
-			int players = world != null ? world.getPlayers() : -1;
-			String region = world != null ? regionLabel(world.getRegion()) : "";
+			shown.add(current);
+		}
+		synchronized (pinned)
+		{
+			shown.addAll(pinned);
+		}
 
-			WorldPingStats stats = statsByWorld.get(id);
-			if (stats == null || !stats.hasData())
+		List<World> relevant = new ArrayList<>();
+		if (config.profile() == PingProfile.CUSTOM)
+		{
+			for (int id : WorldListParser.parse(config.customWorlds()))
 			{
-				rows.add(new WorldStatus(id, region, players, activity, false, 0, 0, 0, false));
+				World w = worldResult.findWorld(id);
+				if (w != null)
+				{
+					relevant.add(w);
+				}
 			}
-			else
+		}
+		else
+		{
+			WorldFilter filter = buildFilter(worldResult, current);
+			for (World w : worldResult.getWorlds())
 			{
-				boolean green = stats.isConsistent(avgThreshold, jitterThreshold);
-				rows.add(new WorldStatus(id, region, players, activity, true,
-					stats.average(), stats.jitter(), stats.sampleCount(), green));
+				WorldInfo info = new WorldInfo(w.getId(), w.getPlayers(), w.getRegion(), w.getActivity(), w.getTypes());
+				if (WorldSelector.passes(info, filter))
+				{
+					relevant.add(w);
+				}
 			}
 		}
 
-		// Best-first: worlds with data before those still gathering, then lowest average ping.
+		relevant.sort(Comparator.comparingDouble((World w) -> displayScore(w.getId(), avgT, jitT)));
+		for (World w : relevant)
+		{
+			if (shown.size() >= limit)
+			{
+				break;
+			}
+			shown.add(w.getId());
+		}
+
+		final List<WorldStatus> rows = new ArrayList<>();
+		for (int id : shown)
+		{
+			rows.add(buildStatus(id, worldResult, avgT, jitT));
+		}
 		rows.sort(Comparator
 			.comparing(WorldStatus::hasData).reversed()
 			.thenComparingInt(WorldStatus::getAverage)
 			.thenComparingInt(WorldStatus::getWorldId));
 
 		final String status = config.profile() + " · " + config.region();
-		SwingUtilities.invokeLater(() -> p.display(rows, currentWorld, status));
+		SwingUtilities.invokeLater(() -> p.display(rows, current, status));
 	}
 
-	/** Switches (hops) to the given world. Safe to call from the Swing thread. */
+	/** Lower = better (shown first): consistent worlds by average, then unstable, then no-data last. */
+	private double displayScore(int id, int avgT, int jitT)
+	{
+		WorldPingStats s = statsByWorld.get(id);
+		if (s == null || !s.hasData())
+		{
+			return 100_000;
+		}
+		return s.isConsistent(avgT, jitT) ? s.average() : 10_000 + s.average();
+	}
+
+	private WorldStatus buildStatus(int id, WorldResult worldResult, int avgT, int jitT)
+	{
+		World w = worldResult.findWorld(id);
+		String activity = w != null && w.getActivity() != null ? w.getActivity() : "";
+		int players = w != null ? w.getPlayers() : -1;
+		String region = w != null ? regionLabel(w.getRegion()) : "";
+
+		WorldPingStats s = statsByWorld.get(id);
+		if (s == null || !s.hasData())
+		{
+			return new WorldStatus(id, region, players, activity, false, 0, 0, 0, false);
+		}
+		return new WorldStatus(id, region, players, activity, true,
+			s.average(), s.jitter(), s.sampleCount(), s.isConsistent(avgT, jitT));
+	}
+
+	/** Switches (hops) to the given world AND pins it so it keeps being scanned. Called from the EDT. */
 	private void switchToWorld(int worldId)
 	{
 		WorldResult worldResult = worldService.getWorlds();
@@ -298,6 +449,8 @@ public class PingWorldsPlugin extends Plugin
 		{
 			return;
 		}
+
+		pinned.add(worldId); // keep monitoring this world even after we move on
 
 		// changeWorld must run on the client thread. Works at the login screen (sets the world you
 		// will log into) and in-game (hops), mirroring RuneLite's own World Hopper.
